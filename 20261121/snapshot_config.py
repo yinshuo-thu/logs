@@ -9,7 +9,9 @@ from torch.nn import functional as F
 @dataclass(frozen=True)
 class Experiment:
     seed: int = 20261121
-    hours_deadline: int = 36
+    first_report_hour: int = 36
+    goal_ic: float = 0.30
+    quantity_history_days: int = 5
     joint_stop_hour: int = 22
     selection_stop_hour: int = 33
     val_days: int = 15
@@ -65,6 +67,30 @@ def mid_move_bp(mid, previous, valid_pair):
     one = torch.ones_like(mid)
     move = 1e4 * torch.log(torch.where(valid, mid, one) / torch.where(valid, previous, one))
     return move.float(), valid
+
+
+def price_from_open_bp(price, open_price, open_known):
+    """Broadcast an as-of, same-day security open to the input price fields."""
+    return mid_move_bp(price, open_price, open_known)
+
+
+def quantity_from_history(quantity, past_daily_medians):
+    """For one security: q[..., F], refs[D,F] in calendar order, strictly before today.
+    Caller supplies a row per market trading day; missing values are NaN.
+    Returns normalized values, observation mask, and usable history counts per field.
+    """
+    if past_daily_medians.ndim != 2 or quantity.shape[-1] != past_daily_medians.shape[1]:
+        raise ValueError("expected quantity[..., fields] and history[days, fields]")
+    history = past_daily_medians[-CFG.quantity_history_days:].to(quantity.device, torch.float64)
+    if history.shape[0] == 0:
+        valid = torch.zeros_like(quantity, dtype=torch.bool)
+        return torch.zeros_like(quantity, dtype=torch.float32), valid, valid.new_zeros(quantity.shape[-1], dtype=torch.long)
+    present = history.isfinite() & (history >= 0)
+    ref = torch.nanquantile(history.masked_fill(~present, float("nan")), 0.5, dim=0)
+    valid = quantity.isfinite() & (quantity >= 0) & ref.isfinite() & (ref > 0)
+    q = torch.where(valid, quantity, 0).double()
+    divisor = torch.where(ref.isfinite() & (ref > 0), ref, 1.)
+    return torch.log1p(q / divisor).float(), valid, present.sum(dim=0)
 
 
 def target_loss(pred, target, valid, scale, ic_weight=0.0):
